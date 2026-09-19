@@ -32,6 +32,11 @@ on:
         required: false
         type: boolean
         default: false
+      keep_going:
+        description: '某个库失败时不中止，继续把剩余库跑完并汇总失败清单（默认开）。全量 52 个库里有 26 个从未构建过，关掉它就会「一轮只暴露一个库」。'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: publish-android-aar-${{ github.ref }}
@@ -164,15 +169,28 @@ jobs:
           # ABI 集合：默认 3 个（arm64-v8a / x86 / x86_64）。勾选 include_armv7a 才是 4 个。
           # ⚠️ 应用侧 reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64，
           #    少一个 ABI ⇒ 32 位设备上 FFmpegKit 加载失败（与本次修的崩溃同源）。
+          # ⚠️ 必须**两个都禁**：android.sh:262 的判据是
+          #    `ENABLED_ARCHITECTURES[ARCH_ARM_V7A] || ENABLED_ARCHITECTURES[ARCH_ARM_V7A_NEON]`，
+          #    只写 --disable-arm-v7a 的话 armeabi-v7a 仍会进 APP_ABI ——
+          #    之前那版「3 个 ABI」的承诺是假的（已实测确认）。
           FLAGS=(-d --lts --full --enable-gpl --disable-lib-sdl \
                  --enable-android-media-codec --enable-android-zlib)
           if [[ "${{ github.event.inputs.include_armv7a }}" == "true" ]]; then
             ABIS="armeabi-v7a arm64-v8a x86 x86_64"
           else
             ABIS="arm64-v8a x86 x86_64"
-            FLAGS+=(--disable-arm-v7a)
+            FLAGS+=(--disable-arm-v7a --disable-arm-v7a-neon)
             echo "::warning::include_armv7a=false → AAR 只有 3 个 ABI，不能直接替换 4 ABI 的应用"
           fi
+
+          # keep-going：一个库失败不再终止整轮，跑完剩余库后一次性列出失败清单
+          # （main-android.sh 会打印 `KEEP_GOING_FAILED_LIBRARIES: ...`）。
+          # 默认开：目前 52 个库里只有 22 个被验证过，关掉就是「一轮只暴露一个库」。
+          if [[ "${{ github.event.inputs.keep_going }}" == "true" ]]; then
+            export FFMPEG_KIT_KEEP_GOING=1
+            echo "keep_going=yes → 库失败不中止，末尾汇总失败清单"
+          fi
+
           echo "BUILD_ABIS=${ABIS}" >> "$GITHUB_ENV"
           echo "BUILD_CMD=android.sh ${FLAGS[*]}" >> "$GITHUB_ENV"
           echo "=== android.sh ${FLAGS[*]} ==="
@@ -265,6 +283,19 @@ jobs:
                 echo "- ✅ 补丁阶段完成（\`All patches applied successfully\`）"
               else
                 echo "- ⚠️ **补丁阶段未完成** —— 失败点很可能在 \`patches/android-apply-patches.sh\`；该脚本里 \`apply_ffmpeg_dual_tls\` 与 \`apply_x264_android_osdep_lfs\` 是唯二**没有回退**的硬失败（其余每一处都有 perl/python 兜底），这种不对称很可疑。"
+              fi
+              # keep-going 汇总 —— 这是本轮 CI 最重要的输出：一次列出所有失败的库。
+              # 没有它，每轮只会暴露一个库，26 个未验证的库就要 26 轮。
+              if grep -q 'KEEP_GOING_FAILED_LIBRARIES' ci-console.log; then
+                echo
+                echo "### ⛔ 本轮失败的库（keep-going 汇总）"
+                echo
+                echo '```'
+                grep -h 'KEEP_GOING_FAILED_LIBRARIES' ci-console.log | tail -1
+                echo '```'
+                echo
+                echo "未列出的库均已 \`ok\`。逐个修掉后重跑即可收敛。"
+                echo
               fi
               if grep -q 'Creating Android archive under prebuilt' ci-console.log; then
                 echo "- ✅ 走到了打包 AAR 阶段"

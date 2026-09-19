@@ -56,6 +56,13 @@ fi
 
 # BUILD ENABLED LIBRARIES AND THEIR DEPENDENCIES
 let completed=0
+
+# keep-going 模式（FFMPEG_KIT_KEEP_GOING=1）：某个库失败时不再 exit 1，而是记下它、
+# 把它标成「已完成」让依赖它的库继续跑，最后一次性列出本轮所有失败的库。
+# 起因：`-d --lts --full --enable-gpl` 实际启用 52 个库，而默认的「第一个失败就退」
+# 意味着「还剩多少个没验证过的库」就等于「还要烧多少轮 CI」。本仓当前有 26 个库
+# 从未构建过（见 build-logs 的取证），一轮一轮试是不可接受的。
+FFMPEG_KIT_KEEP_GOING_FAILURES=""
 while [ ${#enabled_library_list[@]} -gt $completed ]; do
   for library in "${enabled_library_list[@]}"; do
     let run=0
@@ -185,6 +192,19 @@ while [ ${#enabled_library_list[@]} -gt $completed ]; do
           declare "$BUILD_COMPLETED_FLAG=1"
           check_if_dependency_rebuilt "${library}"
           echo "ok"
+        elif [ -n "${FFMPEG_KIT_KEEP_GOING}" ]; then
+          # 记下失败，并把它标成「已完成」—— 否则依赖它的库会被永久跳过
+          # （while 循环的条件是 completed 数，标了才能推进，也才不会死循环）。
+          ((completed += 1))
+          declare "$BUILD_COMPLETED_FLAG=1"
+          if [ $RC -eq 200 ]; then
+            FFMPEG_KIT_KEEP_GOING_FAILURES+="${library}(not-supported) "
+            echo -e "not supported\n\nSee build.log for details\n"
+          else
+            FFMPEG_KIT_KEEP_GOING_FAILURES+="${library} "
+            echo -e "failed\n\nSee build.log for details\n"
+          fi
+          echo -e "INFO: [keep-going] ${library} failed (rc=${RC}), continuing with the remaining libraries\n" 1>>"${BASEDIR}"/build.log 2>&1
         elif [ $RC -eq 200 ]; then
           echo -e "not supported\n\nSee build.log for details\n"
           exit 1
@@ -237,6 +257,17 @@ for custom_library_index in "${CUSTOM_LIBRARIES[@]}"; do
     echo "${!library_name}: already built"
   fi
 done
+
+# keep-going 模式：有库失败时不要再往下建 ffmpeg —— 缺库时它必然失败，几百行
+# configure 噪音只会把结论淹掉。直接在这一趟收工，把清单交出去。
+if [[ -n "${FFMPEG_KIT_KEEP_GOING_FAILURES}" ]]; then
+  echo -e "\nKEEP_GOING_FAILED_LIBRARIES: ${FFMPEG_KIT_KEEP_GOING_FAILURES}\n"
+  echo -e "INFO: [keep-going] failed libraries on ${ARCH} (API ${API}): ${FFMPEG_KIT_KEEP_GOING_FAILURES}\n" 1>>"${BASEDIR}"/build.log 2>&1
+
+  # ⚠️ 用 return 而不是 exit：本脚本由 android.sh 以 `. scripts/main-android.sh` 引入，
+  # exit 会把 android.sh 一起终止。return 让外层的 `|| exit 1` 拿到非零 rc。
+  return 1 2>/dev/null || exit 1
+fi
 
 # SKIP TO SPEED UP THE BUILD
 if [[ ${SKIP_ffmpeg} -ne 1 ]]; then
