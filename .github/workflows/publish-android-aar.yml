@@ -25,7 +25,7 @@ env:
 jobs:
   build-and-publish:
     name: Build and publish ffmpeg-kit AAR (macOS, like local Mac)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 720
     permissions:
       contents: write
