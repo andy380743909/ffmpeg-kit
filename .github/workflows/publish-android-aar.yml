@@ -136,7 +136,7 @@ jobs:
           }
           set +e
           bash ./android.sh -d --lts --full --enable-gpl \
-            --disable-lib-sdl --enable-android-media-codec --enable-android-zlib
+            --disable-lib-sdl --disable-arm-v7a --enable-android-media-codec --enable-android-zlib
           rc=$?
           set -e
           if [[ "${rc}" -ne 0 ]]; then
