@@ -1,5 +1,23 @@
 # Same recipe as a local macOS full GPL LTS build: same `./android.sh` flags, NDK r28b,
 # ANDROID_PATCH_ROOT, libc++ 16KB relink (via android.sh), and Gradle AAR.
+#
+# ── 2026-09-19 排查与修复 ───────────────────────────────────────────────────────
+# run #1 (e752c56) 死在步骤 8「Build」：android.sh 在第 17 分钟返回 1（完整 build.log
+#   在那次 run 的 build-logs-1 artifact 里，需登录才能下载）。
+# run #2 (036ae62) 更早死在步骤 4「Install build dependencies」—— 与 run #1 相比只多
+#   了一个 --disable-lib-sdl，brew 包列表逐字相同，所以那不是改动引起的：
+#   macos-14 已被 GitHub 标记 deprecated，Homebrew 也不再为它出 bottle ⇒ groff 的
+#   依赖链退化成源码编译 ⇒ netpbm 要用 SVN 从 SourceForge 拉源码，而 runner 里没有
+#   可用的 svn、DNS 也解析不了 svn.code.sf.net ⇒ 装依赖阶段就中止。
+# 本次改动（一次只动一个变量）：
+#   ① runner: macos-14 → macos-15（GA，Homebrew 有 bottle）——修掉步骤 4 的失败；
+#   ② groff / gtk-doc / docbook-xsl 降为「可失败」：它们只服务 man page 与文档生成
+#      （是从上游 apt 清单直译过来的），Android 的 .so 构建用不到，却能把
+#      netpbm→SVN 这条死路拖进来；
+#   ③ 构建输出 tee 到 ci-console.log，并把关键片段写进 Job Summary：artifact 需要
+#      登录才能下载，而 run 页面匿名可读 ⇒ 失败原因能直接看到，不必再来一轮盲试；
+#   ④ 新增 AAR 出厂验收 scripts/ci/verify-aar.py：禁止未弱化的 PLATFORM_ 孤儿符号
+#      + 要求 64 位库 16KB 对齐。把「真机启动崩溃」那类问题挡在产物之前。
 name: Publish Android AAR (full GPL LTS)
 
 on:
@@ -9,6 +27,11 @@ on:
         description: 'Git tag for the GitHub Release (e.g. v6.0.0-full-gpl-lts). Leave empty to upload an artifact only.'
         required: false
         type: string
+      include_armv7a:
+        description: '是否同时构建 armeabi-v7a。默认否（3 ABI，验证更快）；⚠️ 勾上才是 4 ABI，可直接替换现有 AAR。'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: publish-android-aar-${{ github.ref }}
@@ -25,8 +48,11 @@ env:
 jobs:
   build-and-publish:
     name: Build and publish ffmpeg-kit AAR (macOS, like local Mac)
+    # macos-14 已被 GitHub 标记 deprecated（actions/runner-images#13518），且 Homebrew
+    # 不再为它提供 bottle ⇒ 会回退到源码编译并卡在 netpbm/SVN。macos-15 是 GA。
     runs-on: macos-15
-    timeout-minutes: 720
+    # GitHub 托管 runner 的作业硬上限是 6 小时；留出写诊断与上传产物的余量。
+    timeout-minutes: 350
     permissions:
       contents: write
     defaults:
@@ -35,12 +61,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -48,11 +74,19 @@ jobs:
       - name: Install build dependencies (Homebrew)
         run: |
           set -euo pipefail
+          # 显式 update 一次即可；禁止每次 install 再自动 update（拖时间并引入配方漂移）
+          export HOMEBREW_NO_AUTO_UPDATE=1
           brew update
           brew install \
             autoconf automake libtool pkg-config nasm cmake texinfo yasm bison \
-            autogen wget gettext meson ninja gperf groff libtasn1 gpatch
-          brew install gtk-doc docbook-xsl || true
+            autogen wget gettext meson ninja gperf libtasn1 gpatch
+          # 文档/手册工具链：只服务 man page 生成，构建 .so 用不到。装不上就放行，
+          # 避免 groff → netpbm → SVN 这条链成为单点（它已让 run #2 挂在第 4 步）。
+          for f in groff gtk-doc docbook-xsl; do
+            brew install "$f" \
+              || echo "::warning::optional brew package '$f' failed to install (continuing)"
+          done
+          # bison / gettext 必须排到系统版本前面（macOS 自带的都太老）
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
@@ -119,28 +153,40 @@ jobs:
 
       - name: Build full GPL LTS AAR (same flags as local Mac)
         run: |
-          set -euo pipefail
+          set -uo pipefail
           chmod +x ./android.sh
           git fetch --tags --force || true
           echo "=== git describe (android.sh needs this) ==="
           git describe --tags --always || true
           echo "=== disk ==="
           df -h .
-          dump_logs() {
-            echo "========== tail build.log =========="
-            tail -n 250 build.log 2>/dev/null || echo "(no build.log)"
-            echo "========== tail ffbuild/config.log =========="
-            tail -n 120 src/ffmpeg/ffbuild/config.log 2>/dev/null || echo "(no config.log)"
-            echo "========== tail: last native build lines (grep -i error) =========="
-            grep -i -n -E 'error:|fatal:|failed|\(\*\)' build.log 2>/dev/null | tail -n 40 || true
-          }
+
+          # ABI 集合：默认 3 个（arm64-v8a / x86 / x86_64）。勾选 include_armv7a 才是 4 个。
+          # ⚠️ 应用侧 reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64，
+          #    少一个 ABI ⇒ 32 位设备上 FFmpegKit 加载失败（与本次修的崩溃同源）。
+          FLAGS=(-d --lts --full --enable-gpl --disable-lib-sdl \
+                 --enable-android-media-codec --enable-android-zlib)
+          if [[ "${{ github.event.inputs.include_armv7a }}" == "true" ]]; then
+            ABIS="armeabi-v7a arm64-v8a x86 x86_64"
+          else
+            ABIS="arm64-v8a x86 x86_64"
+            FLAGS+=(--disable-arm-v7a)
+            echo "::warning::include_armv7a=false → AAR 只有 3 个 ABI，不能直接替换 4 ABI 的应用"
+          fi
+          echo "BUILD_ABIS=${ABIS}" >> "$GITHUB_ENV"
+          echo "BUILD_CMD=android.sh ${FLAGS[*]}" >> "$GITHUB_ENV"
+          echo "=== android.sh ${FLAGS[*]} ==="
+
+          # 2>&1 | tee：既保留实时输出，又留下可供 Job Summary 引用的副本。
+          # （android.sh 第 218-221 行调用 patches/android-apply-patches.sh 时没有重定向，
+          #   它的输出只走控制台 —— 而它正是最可能的失败点。）
           set +e
-          bash ./android.sh -d --lts --full --enable-gpl \
-            --disable-lib-sdl --disable-arm-v7a --enable-android-media-codec --enable-android-zlib
-          rc=$?
+          bash ./android.sh "${FLAGS[@]}" 2>&1 | tee ci-console.log
+          rc=${PIPESTATUS[0]}
           set -e
+          echo "BUILD_RC=${rc}" >> "$GITHUB_ENV"
+          echo "android.sh exit code = ${rc}"
           if [[ "${rc}" -ne 0 ]]; then
-            dump_logs
             exit "${rc}"
           fi
 
@@ -158,13 +204,27 @@ jobs:
           cp "${AAR_PATH}" "${DEST}"
           echo "aar_path=${DEST}" >> "$GITHUB_OUTPUT"
           ls -lh release-assets/
+          shasum -a 256 release-assets/*.aar
+
+      # 出厂验收：不合格就让作业红掉，别把一个会在真机 dlopen 阶段崩的包放出去。
+      - name: Verify AAR (no orphan PLATFORM_ symbols · 64-bit 16KB alignment)
+        run: |
+          set -uo pipefail
+          set +e
+          python3 scripts/ci/verify-aar.py \
+            "release-assets/ffmpeg-kit-full-gpl-lts-${{ github.run_number }}-${{ github.sha }}.aar" \
+            --prefix PLATFORM_ --require-16k 2>&1 | tee ci-verify.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit "${rc}"
 
       - name: Upload workflow artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-kit-full-gpl-lts-aar-${{ github.run_number }}
           path: release-assets/*.aar
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Create GitHub Release
         if: ${{ github.event.inputs.release_tag != '' }}
@@ -178,6 +238,95 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # 关键：run 页面匿名可读，而 artifact 需要登录才能下载。
+      # 所以把「为什么失败」直接写进 Job Summary —— 否则每轮只能盲试。
+      - name: Write diagnostics to Job Summary
+        if: always()
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
+          AAR_PATH="$(ls release-assets/*.aar 2>/dev/null | head -1 || true)"
+          {
+            echo "## ffmpeg-kit AAR — 诊断"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner | \`${{ runner.os }} / ${{ runner.arch }}\` |"
+            echo "| android.sh 退出码 | \`${BUILD_RC:-未执行}\` |"
+            echo "| 构建 ABI | \`${BUILD_ABIS:-?}\` |"
+            echo "| 命令 | \`${BUILD_CMD:-?}\` |"
+            if [[ -n "${AAR_PATH}" ]]; then
+              echo "| AAR | \`$(basename "${AAR_PATH}")\` · $(du -h "${AAR_PATH}" | cut -f1) · sha256 \`$(shasum -a 256 "${AAR_PATH}" | cut -c1-16)…\` |"
+            else
+              echo "| AAR | ❌ 未产出 |"
+            fi
+            echo
+            if [[ -f ci-console.log ]]; then
+              if grep -q 'All patches applied successfully' ci-console.log; then
+                echo "- ✅ 补丁阶段完成（\`All patches applied successfully\`）"
+              else
+                echo "- ⚠️ **补丁阶段未完成** —— 失败点很可能在 \`patches/android-apply-patches.sh\`；该脚本里 \`apply_ffmpeg_dual_tls\` 与 \`apply_x264_android_osdep_lfs\` 是唯二**没有回退**的硬失败（其余每一处都有 perl/python 兜底），这种不对称很可疑。"
+              fi
+              if grep -q 'Creating Android archive under prebuilt' ci-console.log; then
+                echo "- ✅ 走到了打包 AAR 阶段"
+              else
+                echo "- ℹ️ 未走到「Creating Android archive」"
+              fi
+              echo
+              echo "<details><summary>ci-console.log 里的错误行（最多 60 行）</summary>"
+              echo
+              echo '```'
+              grep -n -iE 'error|fatal|cannot|No such file|not found|failed|could not' ci-console.log | tail -n 60 || true
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+              echo "<details><summary>ci-console.log 末尾 120 行</summary>"
+              echo
+              echo '```'
+              tail -n 120 ci-console.log
+              echo '```'
+              echo
+              echo "</details>"
+            else
+              echo "- ⚠️ 没有 ci-console.log（构建步骤未执行到）"
+            fi
+            if [[ -f ci-verify.log ]]; then
+              echo
+              echo "### AAR 验收结果"
+              echo
+              echo '```'
+              cat ci-verify.log
+              echo '```'
+            fi
+          } >> "$S"
+
+          # build.log / config.log 可能很大，单独放
+          {
+            if [[ -f build.log ]]; then
+              echo
+              echo "<details><summary>build.log 末尾 150 行</summary>"
+              echo
+              echo '```'
+              tail -n 150 build.log
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            if [[ -f src/ffmpeg/ffbuild/config.log ]]; then
+              echo
+              echo "<details><summary>src/ffmpeg/ffbuild/config.log 末尾 80 行</summary>"
+              echo
+              echo '```'
+              tail -n 80 src/ffmpeg/ffbuild/config.log
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "---"
+            echo "完整日志见 artifact \`build-logs-${{ github.run_number }}\`（下载需登录）。"
+          } >> "$S"
+
       - name: Upload build logs (on failure or always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -185,5 +334,7 @@ jobs:
           name: build-logs-${{ github.run_number }}
           path: |
             build.log
+            ci-console.log
+            ci-verify.log
             src/ffmpeg/ffbuild/config.log
           if-no-files-found: ignore
