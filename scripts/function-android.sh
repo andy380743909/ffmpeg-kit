@@ -240,10 +240,32 @@ get_common_cflags() {
     local LTS_BUILD_FLAG="-DFFMPEG_KIT_LTS "
   fi
 
+  # ⚠️ 这里的 API 级别必须是 get_toolchain_clang_api()，**不能**用 ${API}。
+  #
+  # NDK r26+ 不再提供 API < 21 的 clang wrapper（见 get_toolchain_clang_api 的注释），
+  # 所以 32 位的 LTS 构建实际用的 wrapper 是 ...-android21-clang，它**内置**
+  # `__ANDROID_MIN_SDK_VERSION__=21`。原来这里再传一遍 ${API}(16)，等于同一个
+  # 「编译期 API 级别」有了两份实现，而两份的值不一样 —— 已在 CI 上引出一对失败：
+  #
+  #   ① clang 把这个 `-D` 当成编译目标 API（实测：`__ANDROID_API__` 由 21 变 16），
+  #      并吐一条 `macro redefined` 警告。libvpx 的 configure 用
+  #      `check_cc -Werror` 整体试这个 flag 列表 ⇒ 警告升级成错误 ⇒
+  #      "Requested extra CFLAGS ... not supported by compiler"。
+  #   ② NDK 的 zlib.h 按 `__ANDROID_API__` 改写 ZLIB_VERNUM（<19 ⇒ 0x1260），而
+  #      libpng 生成 pnglibconf.h 的那条 make recipe **不带 CFLAGS**（裸 wrapper ⇒ 21
+  #      ⇒ 0x1280）⇒ pngpriv.h:910 的 `PNG_ZLIB_VERNUM != ZLIB_VERNUM` 硬报错，
+  #      并连锁带走 freetype / leptonica / fontconfig / harfbuzz / libass / tesseract。
+  #
+  # 用 wrapper 真正使用的那个值，两处就恒等。对 32 位来说这意味着声明的 API 从 16
+  # 变成 21 —— 这不是放宽容忍度，而是把编译期 API 声明成它本来的样子（wrapper 与
+  # 链接用的 libc stub 本来就是 21）。
+  local CLANG_API
+  CLANG_API=$(get_toolchain_clang_api)
+
   if [[ $(compare_versions "$DETECTED_NDK_VERSION" "23") -ge 0 ]]; then
-    echo "-fstrict-aliasing -DANDROID_NDK -fPIC -DANDROID ${LTS_BUILD_FLAG}-D__ANDROID__ -D__ANDROID_MIN_SDK_VERSION__=${API}"
+    echo "-fstrict-aliasing -DANDROID_NDK -fPIC -DANDROID ${LTS_BUILD_FLAG}-D__ANDROID__ -D__ANDROID_MIN_SDK_VERSION__=${CLANG_API}"
   else
-    echo "-fno-integrated-as -fstrict-aliasing -DANDROID_NDK -fPIC -DANDROID ${LTS_BUILD_FLAG}-D__ANDROID__ -D__ANDROID_API__=${API}"
+    echo "-fno-integrated-as -fstrict-aliasing -DANDROID_NDK -fPIC -DANDROID ${LTS_BUILD_FLAG}-D__ANDROID__ -D__ANDROID_API__=${CLANG_API}"
   fi
 }
 

@@ -224,6 +224,9 @@ fi
 # SAVE ORIGINAL API LEVEL = NECESSARY TO BUILD 64bit ARCHITECTURES
 export ORIGINAL_API=${API}
 
+# keep-going 模式：记录哪些架构没通过，见架构循环之后。
+FFMPEG_KIT_KEEP_GOING_ARCH_FAILURES=""
+
 # BUILD ENABLED LIBRARIES ON ENABLED ARCHITECTURES
 for run_arch in {0..12}; do
   if [[ ${ENABLED_ARCHITECTURES[$run_arch]} -eq 1 ]]; then
@@ -240,7 +243,17 @@ for run_arch in {0..12}; do
     export TOOLCHAIN_ARCH=$(get_toolchain_arch)
 
     # EXECUTE MAIN BUILD SCRIPT
-    . "${BASEDIR}"/scripts/main-android.sh "${ENABLED_LIBRARIES[@]}" || exit 1
+    if [[ -n "${FFMPEG_KIT_KEEP_GOING}" ]]; then
+      # keep-going 模式：某个架构失败不终止，继续跑下一个架构。
+      # 否则「一轮拿全清单」只在第一个架构内部成立 —— run #6 就因此把 x86-64 的结果
+      # 整块丢掉了（x86 一失败，这里当场 exit 1，后面的架构根本没轮到）。
+      . "${BASEDIR}"/scripts/main-android.sh "${ENABLED_LIBRARIES[@]}"
+      if [ $? -ne 0 ]; then
+        FFMPEG_KIT_KEEP_GOING_ARCH_FAILURES+="${ARCH} "
+      fi
+    else
+      . "${BASEDIR}"/scripts/main-android.sh "${ENABLED_LIBRARIES[@]}" || exit 1
+    fi
 
     # CLEAR FLAGS
     for library in {0..61}; do
@@ -250,6 +263,15 @@ for run_arch in {0..12}; do
     done
   fi
 done
+
+# keep-going 模式：只要有一个架构没通过，就不再往下产出 AAR（缺库的 AAR 是废品），
+# 但所有架构的结果都必须先收齐 —— 这正是 keep-going 存在的意义。
+# 注意判据是「有真失败」：只有「本架构不支持」时不算失败，x86 因此仍能走到 ffmpeg。
+if [[ -n "${FFMPEG_KIT_KEEP_GOING}" ]] && [[ -n "${FFMPEG_KIT_KEEP_GOING_ARCH_FAILURES}" ]]; then
+  echo -e "\nKEEP_GOING_FAILED_ARCHITECTURES: ${FFMPEG_KIT_KEEP_GOING_ARCH_FAILURES}\n"
+  echo -e "INFO: [keep-going] architectures with failures: ${FFMPEG_KIT_KEEP_GOING_ARCH_FAILURES}; skipping AAR assembly\n" 1>>"${BASEDIR}"/build.log 2>&1
+  exit 1
+fi
 
 # GET BACK THE ORIGINAL API LEVEL
 export API=${ORIGINAL_API}
