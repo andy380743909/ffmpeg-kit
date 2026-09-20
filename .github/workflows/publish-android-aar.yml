@@ -169,14 +169,27 @@ jobs:
           # ABI 集合：默认 3 个（arm64-v8a / x86 / x86_64）。勾选 include_armv7a 才是 4 个。
           # ⚠️ 应用侧 reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64，
           #    少一个 ABI ⇒ 32 位设备上 FFmpegKit 加载失败（与本次修的崩溃同源）。
-          # ⚠️ 必须**两个都禁**：android.sh:262 的判据是
+          # ⚠️ 「**去掉** armeabi-v7a」必须两个都禁：android.sh 拼 ANDROID_ARCHITECTURES 处的判据是
           #    `ENABLED_ARCHITECTURES[ARCH_ARM_V7A] || ENABLED_ARCHITECTURES[ARCH_ARM_V7A_NEON]`，
           #    只写 --disable-arm-v7a 的话 armeabi-v7a 仍会进 APP_ABI ——
           #    之前那版「3 个 ABI」的承诺是假的（已实测确认）。
+          #    「**保留** armeabi-v7a」时方向恰好相反：只禁 arm-v7a、留 neon（见下面的分支注释）。
+          #    这两条别互相搬运 —— 一个是「或」判据要求全禁，一个是产物布局要求只留 neon。
           FLAGS=(-d --lts --full --enable-gpl --disable-lib-sdl \
                  --enable-android-media-codec --enable-android-zlib)
           if [[ "${{ github.event.inputs.include_armv7a }}" == "true" ]]; then
             ABIS="armeabi-v7a arm64-v8a x86 x86_64"
+            # ⚠️ 只关 arm-v7a、**保留 arm-v7a-neon** —— 这才是 armeabi-v7a 那一格的正确来源。
+            #    两个都开（即什么都不加）是错的，两重代价：
+            #      ① 多跑一整个 arm-v7a pass（5 个 pass 而非 4 个）；
+            #      ② android/jni/Android.mk:97 的判据是 `MY_ARMV7_NEON && !MY_ARMV7`
+            #         才把 MY_BUILD_GENERIC_FFMPEG_KIT 置 false。两个 marker 都在时它保持 true
+            #         ⇒ 除 7 个 *_neon.so 外还会多建 plain libav*.so ×7 + libffmpegkit.so
+            #         ⇒ armeabi-v7a 变成 18 个 .so 而不是 10 个。
+            #    只留 neon 时：`.armv7neon` 在、`.armv7` 不在 ⇒ 恰好 10 个
+            #      （7 个 *_neon.so + libc++_shared.so + libffmpegkit_abidetect.so
+            #        + libffmpegkit_armv7a_neon.so），与现役那份 AAR 的 armeabi-v7a 逐项一致。
+            FLAGS+=(--disable-arm-v7a)
           else
             ABIS="arm64-v8a x86 x86_64"
             FLAGS+=(--disable-arm-v7a --disable-arm-v7a-neon)
