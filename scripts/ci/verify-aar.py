@@ -44,6 +44,34 @@ PT_LOAD = 1
 STB_NAMES = {0: "LOCAL", 1: "GLOBAL", 2: "WEAK"}
 PAGE_16K = 16384
 
+# 每个 ABI 必须齐备的库（按**前缀**匹配）。用前缀而不是全名，是因为 armeabi-v7a
+# 走的是另一套命名：libavcodec_neon.so / libffmpegkit_armv7a_neon.so。
+# 判据来源：android/jni/ffmpeg/neon/Android.mk 与 android/jni/Android.mk 的
+# LOCAL_MODULE —— 也就是「构建脚本打算产出什么」。
+REQUIRED_SO_PREFIXES = (
+    "libavcodec", "libavdevice", "libavfilter", "libavformat",
+    "libavutil", "libswresample", "libswscale",
+)
+ALWAYS_REQUIRED_SO = ("libc++_shared.so", "libffmpegkit_abidetect.so")
+
+
+def missing_required_so(so_names):
+    """返回该 ABI 缺了哪些必备库（空列表 = 齐备）。
+
+    为什么值得单独查：产物缺一个 .so 是**静默**的 —— Gradle 照常打 AAR，Java 侧
+    直到运行时 loadLibrary 才炸，而且炸在用户手里。更麻烦的是，库脚本里任何一处
+    「跳过」逻辑的 bug 都长成这样（本仓的 keep-going 就会跳过依赖不可用的库）。
+    """
+    lack = [p + "*.so" for p in REQUIRED_SO_PREFIXES
+            if not any(n.startswith(p) for n in so_names)]
+    lack += [n for n in ALWAYS_REQUIRED_SO if n not in so_names]
+    # 实现库（64 位是 libffmpegkit.so，32 位 NEON 是 libffmpegkit_armv7a_neon.so）
+    # 必须有一个，否则 FFmpegKitConfig 加载不到实现。
+    if not any(n.startswith("libffmpegkit") and not n.startswith("libffmpegkit_abidetect")
+               for n in so_names):
+        lack.append("libffmpegkit*.so（实现库）")
+    return lack
+
 
 class NotElf(Exception):
     pass
@@ -173,11 +201,17 @@ def main(argv=None):
     ap.add_argument("--require-16k", nargs="?", const="arm64-v8a,x86_64", default=None,
                     metavar="ABI[,ABI]",
                     help="要求这些 ABI 的每个 .so LOAD 段都按 16KB 对齐（缺省 arm64-v8a,x86_64）")
+    ap.add_argument("--expect-abis", default=None, metavar="ABI[,ABI]",
+                    help="断言产物**恰好**含这些 ABI —— 直传 workflow 的 BUILD_ABIS。"
+                         "逗号或空格分隔；不给则只清点、不校验。")
     ap.add_argument("--quiet", action="store_true", help="只打印表格与结论")
     args = ap.parse_args(argv)
 
     prefixes = args.prefix or ["PLATFORM_"]
     strict_16k = [x.strip() for x in args.require_16k.split(",")] if args.require_16k else []
+    # 逗号与空格都接受：workflow 里 BUILD_ABIS="arm64-v8a x86 x86_64"，用的是 **Gradle
+    # 的 ABI 名**，而它与 jni/<abi>/ 的目录名逐字相同，所以可以原样吃进来。
+    expect_abis = [x for x in (args.expect_abis or "").replace(",", " ").split() if x]
 
     per_abi = {}
     for abi, name, data in iter_so(args.target):
@@ -188,12 +222,13 @@ def main(argv=None):
             continue
         rec = per_abi.setdefault(
             abi, {"files": 0, "strong": 0, "weak": 0, "names": [], "aligns": set(),
-                  "is64": False, "bad16k": []})
+                  "is64": False, "bad16k": [], "so": set()})
         rec["files"] += 1
         rec["strong"] += strong
         rec["weak"] += weak
         rec["names"].extend("%s:%s" % (name, s) for s in names)
         rec["aligns"] |= aligns
+        rec["so"].add(name)
         rec["is64"] = rec["is64"] or is64
         if is64 and any(a < PAGE_16K for a in aligns):
             rec["bad16k"].append(
@@ -203,14 +238,32 @@ def main(argv=None):
         print("✗ 没找到任何 jni/<abi>/*.so —— 这个包看着不像 ffmpeg-kit AAR")
         return 1
 
+    # ---- 判据二：ABI 集合与必备库齐备 --------------------------------------
+    # 「构建哪几个 ABI」在 workflow 里只是**声明**（BUILD_ABIS），产物里实际有几个
+    # 从来没人查过 —— 本仓出过一次「承诺 3 个 ABI、实际并不是」的事，而那种包在
+    # declare-only 的 ABI 上会直接 loadLibrary 失败。这里把声明与产物钉在一起。
+    set_bad = []
+    if expect_abis:
+        for miss in sorted(set(expect_abis) - set(per_abi)):
+            set_bad.append("缺少：%s（声明要构建，产物里没有）" % miss)
+        for extra in sorted(set(per_abi) - set(expect_abis)):
+            set_bad.append("多出：%s（产物里有，但没声明要构建）" % extra)
+    so_lack = {}
+    for abi in sorted(per_abi):
+        lack = missing_required_so(per_abi[abi]["so"])
+        if lack:
+            so_lack[abi] = lack
+
     print("目标: %s" % args.target)
     print("判据: 非 WEAK 的 UND 符号不得以 %s 开头%s" % (
         ", ".join(prefixes),
         "；且 %s 的每个 LOAD 段 p_align >= 0x4000" % ",".join(strict_16k) if strict_16k else ""))
+    if expect_abis:
+        print("      ABI 集合必须恰好是 %s" % ",".join(expect_abis))
     print()
-    hdr = "%-14s %5s %17s %17s %-22s %s" % (
+    hdr = "%-14s %5s %17s %17s %-22s %-20s %s" % (
         "ABI", "库数", "强UND(%s)" % prefixes[0], "弱UND(%s)" % prefixes[0],
-        "LOAD p_align", "16KB")
+        "LOAD p_align", "16KB", "必备库")
     print(hdr)
     print("-" * (len(hdr) + 12))
     failed = False
@@ -225,16 +278,30 @@ def main(argv=None):
             tag = "✗ 含 <0x4000" + ("" if needs16k else "（未强制）")
         else:
             ok16k, tag = True, "✓ 全部 ≥0x4000"
-        print("%-14s %5d %17d %17d %-22s %s" % (
-            abi, r["files"], r["strong"], r["weak"], aligns_txt, tag))
+        so_tag = "✗ 缺 %d 个" % len(so_lack[abi]) if abi in so_lack else "✓ 齐备"
+        print("%-14s %5d %17d %17d %-22s %-20s %s" % (
+            abi, r["files"], r["strong"], r["weak"], aligns_txt, tag, so_tag))
         if r["strong"]:
             failed = True
         if needs16k and not ok16k:
             failed = True
+    if set_bad or so_lack:
+        failed = True
 
     if failed:
         print()
         print("=" * 72)
+        for msg in set_bad:
+            print("✗ ABI 集合不符：%s" % msg)
+        if set_bad:
+            print("    修法：查 workflow 的 ABI 开关。android.sh 的判据是"
+                  "`ENABLED_ARCHITECTURES[ARCH_ARM_V7A] || ENABLED_ARCHITECTURES[ARCH_ARM_V7A_NEON]`，"
+                  "所以关 armeabi-v7a 必须**两个都禁**（--disable-arm-v7a "
+                  "--disable-arm-v7a-neon），否则 APP_ABI 里仍会有它。")
+        for abi in sorted(so_lack):
+            print("✗ %s: 缺少必备库：" % abi)
+            for s in so_lack[abi]:
+                print("    - %s" % s)
         for abi in sorted(per_abi):
             r = per_abi[abi]
             if r["strong"]:
@@ -253,11 +320,15 @@ def main(argv=None):
               "而不是事后改字节。")
         print("  · 16KB 未达标：给链接器加 -Wl,-z,max-page-size=16384；"
               "32 位的 libc++_shared.so 由 scripts/android/relink-libcxx-16kb.sh 重链。")
+        print("  · ABI / 必备库缺项：这类包会静默装进 APK，直到运行时 loadLibrary 才炸。"
+              "先查有没有库被跳过（build.log 里的 SKIPPED_LIBRARIES / "
+              "UNSUPPORTED_LIBRARIES）。")
         return 1
 
     print()
-    print("结论：通过 —— 没有未弱化的目标前缀孤儿符号%s。" %
-          ("，且 %s 均达 16KB 对齐" % ",".join(strict_16k) if strict_16k else ""))
+    print("结论：通过 —— 没有未弱化的目标前缀孤儿符号%s%s。" % (
+        "，且 %s 均达 16KB 对齐" % ",".join(strict_16k) if strict_16k else "",
+        "，且 ABI 集合与必备库齐备" if expect_abis else ""))
     return 0
 
 
