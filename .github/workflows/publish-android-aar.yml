@@ -11,14 +11,29 @@
 #   整个构建跑在 Rosetta 下。
 #
 #   ⇒ 回到上游唯一验证过的平台：ubuntu-22.04 + 原生 x86_64。
-#     上游所有的 Android workflow 都在 ubuntu-22.04；产出那份现役 AAR 的
-#     android-full-gpl-patched.yml 也是（NDK r28b linux 包、默认 4 个 ABI）。
+#     上游所有的 Android workflow 都在 ubuntu-22.04（android-build-scripts.yml 与
+#     periodic-builds-android.yml 的每一个 job 都是）。
+#
+# ⚠️ 2026-09-20 纠正：**上述两份 upstream workflow 都不是我们配方的依据。**
+#    · 产出我们手上那份现役 AAR 的 workflow **不在本仓历史里** —— 它的 runner 路径是
+#      /home/runner/work/ffmpeg-kit-16KB/ffmpeg-kit-16KB/，而本仓是 andy380743909/ffmpeg-kit。
+#    · 本仓历史里能找到的两份（android-full-gpl-patched.yml、android-build-scripts-16kb.yml，
+#      作者 Tamim Hossain）都是 **r28b + `-d`**，且后者连 `--full` 都没有 —— 与现役产物对不上。
+#      此前把它们当基线，因而继承了两个本不该有的变量（NDK r28b、`-d`）。
+#    · **真正的配方写死在产物自己身上**：现役 AAR 的 .so 里嵌着完整 configure 串，据此得到的
+#      既成事实是：ubuntu + NDK r27d（解在 `<repo>/.ndk/` 下）+ API 23 +
+#      `--lts --full --enable-gpl --enable-android-media-codec --enable-android-zlib` +
+#      `--disable-debug --enable-lto`（= 没有 `-d`）+ `--enable-sdl2` + `--enable-libsrt`。
+#      逐字片段：`--cc=aarch64-linux-android23-clang`、
+#      `--sysroot=/home/runner/work/ffmpeg-kit-16KB/ffmpeg-kit-16KB/.ndk/android-ndk-r27d/...`。
+#    · 本次按这条既成事实对齐，只保留**一处**刻意差异：`--disable-lib-sdl`（现役那份是
+#      `--enable-sdl2`，代价见下面 FLAGS 处）。
 #
 # 构建配方：`./android.sh` flags + ANDROID_PATCH_ROOT(patches/android-apply-patches.sh，
 # 由 android.sh:218-220 调用) + libc++ 16KB relink（也在 android.sh 内）+ Gradle AAR。
-# 除 runner 与依赖管理方式外，与上游 android-full-gpl-patched.yml 同源；唯二刻意的差异是
-# --disable-lib-sdl（拔掉 SDL2 的 HIDAPI 孤儿强符号）与 --api-level=23（消除 32/64 位的
-# 编译期 API 分裂）—— 两者在下面 FLAGS 处都有完整判据。
+# 本仓树内已自带补丁钩子（android.sh:218-220）与 16 个 perl 兜底处理器，且
+# tools/patch/cmake/x265/CMakeLists.txt 已是打过 CMP0025 NEW 的状态 ⇒ **不需要**基线里
+# 那两步「pre-download x265 patch」与「inject patch hook into android.sh」。
 #
 # ── 2026-09-19 排查与修复 ───────────────────────────────────────────────────────
 # run #1 (e752c56) 死在步骤 8「Build」：android.sh 在第 17 分钟返回 1（完整 build.log
@@ -155,15 +170,22 @@ jobs:
           echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
 
-      - name: Install Android NDK r28b (linux zip, same as upstream)
+      - name: Install Android NDK r27d (linux zip, same as the AAR we replace)
         run: |
           set -euo pipefail
-          # 与上游 android-full-gpl-patched.yml 同源。r28b 的 64 位链接器默认就是
-          # max-page-size=0x4000（r27 默认 0x1000，要靠脚本里显式传 flag 才到 16KB），
-          # 两条路都能满足 16KB —— 这里跟随上游，少一个变量。
-          curl -fsSL "https://dl.google.com/android/repository/android-ndk-r28b-linux.zip" -o /tmp/ndk.zip
+          # ⚠️ 选 r27d 的唯一理由：**现役 AAR 就是 r27d 编的**（判据是产物里的 configure 串，
+          #    见文件头）。换 NDK 版本等于同时换掉整套 clang 与 sysroot，是「一轮只动一个
+          #    变量」原则下最不该顺手带上的改动。
+          # ⚠️ **别按「新版才好支持 16KB」挑 NDK** —— 16KB 与本仓的 NDK 版本无关：本仓把
+          #    max-page-size 写死在 LDFLAGS 里：
+          #      scripts/function-android.sh:94   APP_LDFLAGS := "-Wl,-z,max-page-size=16384,--hash-style=both"
+          #      scripts/function-android.sh:560  ... -Wl,-z,max-page-size=16384,--hash-style=both ...
+          #    r27 的 64 位链接器默认 0x1000、r28 默认 0x4000，在这个 flag 面前没有差别。
+          #    32 位的 libc++_shared.so（NDK 预编译仍是 4KB）另由
+          #    scripts/android/relink-libcxx-16kb.sh 用 libc++_static.a + libc++abi.a 重链。
+          curl -fsSL "https://dl.google.com/android/repository/android-ndk-r27d-linux.zip" -o /tmp/ndk.zip
           unzip -q -o /tmp/ndk.zip -d "${HOME}/ndk"
-          NDK_DIR="${HOME}/ndk/android-ndk-r28b"
+          NDK_DIR="${HOME}/ndk/android-ndk-r27d"
           echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=${NDK_DIR}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
@@ -183,7 +205,7 @@ jobs:
       - name: Match Gradle ndkVersion to installed NDK
         run: |
           set -euo pipefail
-          NDK_ROOT="${ANDROID_NDK_ROOT:-${HOME}/ndk/android-ndk-r28b}"
+          NDK_ROOT="${ANDROID_NDK_ROOT:-${HOME}/ndk/android-ndk-r27d}"
           if [[ ! -f "${NDK_ROOT}/source.properties" ]]; then
             echo "ERROR: ${NDK_ROOT}/source.properties not found" >&2
             ls -la "${NDK_ROOT}" >&2 || true
@@ -238,7 +260,31 @@ jobs:
           #    注意 23 仍 < 24 ⇒ bionic 的 __BIONIC_AVAILABILITY_GUARD(24) 依旧隐藏
           #    fseeko 的声明 ⇒ scripts/android/tiff.sh 里那两个 ac_cv_func_fseeko*=no
           #    仍然是必需的，别因为「API 提到 23」就把它删掉。
-          FLAGS=(-d --lts --full --enable-gpl --disable-lib-sdl \
+          # ⚠️ ⚠️ 这里**没有 `-d`** —— 这是本次纠正的第二处偏差。`android.sh:82` 的
+          #    `-d | --debug` 不是「多点日志」，它做两件都很重的事：
+          #      ① function-android.sh 的 get_cflags()/get_cxxflags() 是
+          #         `OPTIMIZATION_FLAGS="${FFMPEG_KIT_DEBUG}"` —— **替换**语义，不是追加。
+          #         于是 -Os / -O2 / -flto / -ffunction-sections / -fdata-sections 被
+          #         一个 `-g` 整个顶掉，等于 -O0；这正好落在 libavcodec/libavfilter/
+          #         swscale 的 C 热路径上。
+          #      ② scripts/android/ffmpeg.sh:358-366 会翻到
+          #         `--enable-debug --disable-stripping`（不传 `-d` 才是
+          #         `--disable-debug --enable-lto`）。
+          #    判据来自产物、不是推测：现役 AAR 的 configure 串里是
+          #    `--disable-debug --enable-lto` ⇒ 它**没有**用 `-d` 编。上游自己的 full
+          #    构建（periodic-builds-android.yml）同样不传 `-d`。之前传 `-d` 是从那份
+          #    对不上的基线（r28b + -d）继承来的。
+          #
+          # ⚠️ 同样**不要**顺手加 `--disable-lib-srt`（上游 periodic-builds-android.yml
+          #    就是这么写的，看起来很权威）：x86 上 openssl 会 `return 200`
+          #    （scripts/android/openssl.sh:7，语义是「本架构不支持」这条**永久**事实，
+          #    不是一次失败），scripts/main-android.sh:200-217 据此只标 UNSUPPORTED_ 而
+          #    **刻意不设 OK_**（否则 srt 会在 x86 上被强行构建、必然死在 find_package(OpenSSL)），
+          #    于是依赖它的 srt 在 x86 上自然缺席；arm64-v8a / armeabi-v7a / x86_64 三个
+          #    ABI 上 srt 照常有（现役 AAR 的 x86 configure 串里也确实有 --enable-libsrt，
+          #    因为 ENABLED_LIBRARIES 是开始时就定下的列表）。加 --disable-lib-srt 会让
+          #    **四个** ABI 一起失去 srt —— 那是绕过症状而不是修复。
+          FLAGS=(--lts --full --enable-gpl --disable-lib-sdl \
                  --enable-android-media-codec --enable-android-zlib \
                  --api-level=23)
           if [[ "${{ github.event.inputs.include_armv7a }}" == "true" ]]; then
