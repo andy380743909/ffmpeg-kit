@@ -158,14 +158,27 @@ jobs:
       - name: Install Android NDK r28b (linux zip, same as upstream)
         run: |
           set -euo pipefail
-          # 与上游 android-full-gpl-patched.yml 逐字相同。r28b 的 64 位链接器默认就是
+          # 与上游 android-full-gpl-patched.yml 同源。r28b 的 64 位链接器默认就是
           # max-page-size=0x4000（r27 默认 0x1000，要靠脚本里显式传 flag 才到 16KB），
           # 两条路都能满足 16KB —— 这里跟随上游，少一个变量。
           curl -fsSL "https://dl.google.com/android/repository/android-ndk-r28b-linux.zip" -o /tmp/ndk.zip
           unzip -q -o /tmp/ndk.zip -d "${HOME}/ndk"
-          echo "ANDROID_NDK_ROOT=${HOME}/ndk/android-ndk-r28b" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK=${HOME}/ndk/android-ndk-r28b" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${HOME}/ndk/android-ndk-r28b" >> "$GITHUB_ENV"
+          NDK_DIR="${HOME}/ndk/android-ndk-r28b"
+          echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
+          # ⚠️ 关键防御：上面三个变量只服务**构建脚本**（android.sh 靠它们选 toolchain）。
+          #    但整轮最后一步的 Gradle 里，AGP 是按 **${ANDROID_SDK_ROOT}/ndk/<ndkVersion>**
+          #    去找 NDK 的 —— 而我们把它解在 $HOME/ndk 下，两者错配。
+          #    前 6 轮 CI 从未走到过 Gradle 那一步（都在库构建阶段就结束了），所以这个
+          #    错配从未被暴露；上游那份 android-full-gpl-patched.yml 同样没处理它。
+          #    这里把它链接进 SDK，让「Match Gradle ndkVersion」写进去的版本号一定能解析到。
+          REV="$(awk -F'=' '/^Pkg\.Revision/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "${NDK_DIR}/source.properties")"
+          echo "INFO: NDK Pkg.Revision = ${REV}"
+          mkdir -p "${ANDROID_SDK_ROOT}/ndk"
+          ln -sfn "${NDK_DIR}" "${ANDROID_SDK_ROOT}/ndk/${REV}"
+          ls -l "${ANDROID_SDK_ROOT}/ndk/"
+          test -f "${ANDROID_SDK_ROOT}/ndk/${REV}/source.properties"
 
       - name: Match Gradle ndkVersion to installed NDK
         run: |
