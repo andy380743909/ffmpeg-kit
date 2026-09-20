@@ -323,6 +323,25 @@ get_size_optimization_cflags() {
 
 get_app_specific_cflags() {
   local APP_FLAGS=""
+
+  # ⚠️ libaom / libuuid：这两处的「隐式函数声明」在 NDK r28b（clang 19）下是**错误**，
+  #    在更老的 NDK（clang < 16）下只是警告 —— 上游 ffmpeg-kit 就是在后一种情况下构建
+  #    出来的。这里用 `-Wno-error=` 把**错误降回警告**，而**不是**用 `-Wno-` 把诊断彻底
+  #    关掉：每一处隐式声明仍然会打印在 CI 日志里，可以随时复核，且以后新增的隐式声明
+  #    不会静默溜过。
+  #    两处的符号已逐个核对，全部有定义、且不引入任何新依赖：
+  #      libaom  : 13 个 aom_variance*_neon，每个都恰好一次定义在 aom_dsp/arm/variance_neon.c
+  #                （同一个 libaom.a 内），链接期在包内解决。上游 3.6.1 生成的
+  #                aom_dsp_rtcd.h 没有给 `_neon` 变体出具声明（rtcd 表里只注册了 `_c`），
+  #                属上游缺声明，不是我们配错。返回 unsigned int 与隐式 int 同宽同寄存器，
+  #                参数全是 int/指针、不受默认实参提升影响 ⇒ 代码生成完全一致。
+  #      libuuid : 只有 flock()。它由 bionic libc 提供，**API 21 就有**（已在 API 21 的
+  #                libc stub 上核对符号存在）；返回类型本来就是 int，隐式声明与真实原型
+  #                **完全一致**。根因是 gen_uuid.c 的 `#ifdef HAVE_SYS_FILE_H` 出现在
+  #                `#include "c.h"`（它才带来 config.h）**之前**，所以 <sys/file.h>
+  #                根本没被包含。
+  #
+  # ⚠️ gnutls **不能**用这个办法 —— 理由见下面 gnutls 分支与 scripts/android/gnutls.sh。
   case $1 in
   xvidcore)
     APP_FLAGS=""
@@ -331,7 +350,28 @@ get_app_specific_cflags() {
     APP_FLAGS="-Wno-unused-function -DBIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD"
     ;;
   gnutls)
-    APP_FLAGS="-std=c99 -Wno-unused-function -D_GL_USE_STDLIB_ALLOC=1"
+    # ⚠️ 绝不能用 `-Wno-implicit-function-declaration` 糊过去。
+    #    NDK r27+ 的 bionic 有一个**不对称**：`timezone_t` 这个 typedef 是**无条件**声明的
+    #    （time.h:52），而 mktime_z / tzalloc / tzfree / localtime_rz 四个函数的声明被包在
+    #    `#if __BIONIC_AVAILABILITY_GUARD(35)` 里，符号也**只在 API 35+ 的 libc 里导出**
+    #    （已逐个 API 级别核对：21–34 全没有，35 才有）。
+    #    gnulib 的 time_rz 只用 AC_CHECK_TYPES([timezone_t]) 探测**类型**，于是误判
+    #    「系统已有整套 timezone_t API」⇒ 不再输出自己的 typedef/声明，也不再编译自己的
+    #    time_rz.c（modules/time_rz: `if $HAVE_TIMEZONE_T = 0; AC_LIBOBJ([time_rz])`）。
+    #    如果这里只是把隐式声明降级，编译能过，但 nstrftime.o / parse-datetime.o 会带上
+    #    对 API 35 才存在的符号的引用 —— 那正好就是我们在消灭的那一类崩溃
+    #    （dlopen failed: cannot locate symbol）。本 App 的 minSdk 是 26，等于埋雷。
+    #    正确做法是让 gnulib 回到「自带实现」的历史配置（上游用 NDK <= r26 时就是这样）：
+    #      · gnutls.sh 里把 ac_cv_type_timezone_t 钉成 no ⇒ HAVE_TIMEZONE_T=0
+    #        ⇒ gnulib 重新声明并重新编译自己的 time_rz.c（自足，API 21+ 可用）；
+    #      · 这里用 `-D__timezone_t=tm_zone` 把 bionic 那个无条件的 typedef 改名成
+    #        `struct tm_zone *`，使它和 gnulib 的 `typedef struct tm_zone *timezone_t;`
+    #        成为**同一个类型**。同型 typedef 重定义是合法的；不同型才是硬错误
+    #        （已实测：不带该宏编译直接报 typedef redefinition with different types）。
+    APP_FLAGS="-std=c99 -Wno-unused-function -D_GL_USE_STDLIB_ALLOC=1 -D__timezone_t=tm_zone"
+    ;;
+  libaom | libuuid)
+    APP_FLAGS="-std=c99 -Wno-unused-function -Wno-error=implicit-function-declaration"
     ;;
   kvazaar)
     APP_FLAGS="-std=gnu99 -Wno-unused-function"
@@ -1024,12 +1064,20 @@ android_ndk_cmake() {
     ;;
   esac
 
+  # ⚠️ BUILD_TESTING=OFF：cpu-features 的 CMakeLists 里 `include(CTest)` 默认打开
+  #    BUILD_TESTING，于是 configure 阶段会去**联网下载 googletest**；googletest 自己的
+  #    cmake_minimum_required 也低于 3.5，在 CMake 4 下同样 FATAL_ERROR。
+  # ⚠️ CMAKE_POLICY_VERSION_MINIMUM=3.5：cpu-features 是 `cmake_minimum_required(VERSION 3.0)`，
+  #    CMake 4 已移除对 < 3.5 的兼容（"Compatibility with CMake < 3.5 has been removed"）。
+  #    该变量在 CMake < 3.31 上会被忽略，所以两个版本都安全。
   echo ${cmake} \
     -DCMAKE_VERBOSE_MAKEFILE=0 \
     -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}"/build/cmake/android.toolchain.cmake \
     -DCMAKE_SYSROOT="${ANDROID_SYSROOT}" \
     -DCMAKE_FIND_ROOT_PATH="${ANDROID_SYSROOT}" \
     -DCMAKE_INSTALL_PREFIX="${LIB_INSTALL_PREFIX}" \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -H"${BASEDIR}"/src/"${LIB_NAME}" \
     -B"${BUILD_DIR}" \
     "${ASM_OPTIONS}" \

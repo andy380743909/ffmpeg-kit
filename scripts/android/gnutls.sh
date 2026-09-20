@@ -44,6 +44,31 @@ if [[ ! -f "${BASEDIR}"/src/"${LIB_NAME}"/configure ]] || [[ ${RECONF_gnutls} -e
   overwrite_file ./gnulib/lib/fpending.c ./src/gl/fpending.c || return 1
 fi
 
+# ⚠️ ac_cv_type_timezone_t=no —— 强制 gnulib 回到「自带 timezone_t 实现」的配置。
+#
+#    背景：gnulib 的 time_rz 模块用 `AC_CHECK_TYPES([timezone_t])` 只探测**类型**是否存在，
+#    存在就认为「系统提供了整套 timezone_t API」，于是既不输出自己的 typedef/声明
+#    （gnulib time.in.h: `#if defined _GNU_SOURCE && @GNULIB_TIME_RZ@ && ! @HAVE_TIMEZONE_T@`），
+#    也不 AC_LIBOBJ([time_rz])（modules/time_rz）。
+#
+#    但 NDK r27+ 的 bionic 是不对称的：
+#      · `typedef struct __timezone_t* timezone_t;`  —— 无条件声明，不分 API 级别（time.h:52）
+#      · `mktime_z` / `tzalloc` / `tzfree` / `localtime_rz` 的声明被包在
+#        `#if __BIONIC_AVAILABILITY_GUARD(35)` 里，符号也只在 API 35+ 的 libc 里导出
+#        （已逐级核对：API 21–34 全无，35 才有）。
+#    ⇒ 定向到 < 35 时：gnulib 以为系统有实现（不编译自己的 time_rz.c），而调用点却找不到
+#      任何声明 ⇒ `call to undeclared function 'mktime_z'`（clang 19 下是 error）。
+#
+#    若只把该错误降级为警告，产物会带上对 API 35 才存在的符号的引用，在老设备上
+#    dlopen 直接失败 —— 正是本仓库在消灭的那一类崩溃。所以必须让 gnulib 自带实现。
+#
+#    HAVE_TIMEZONE_T=0 会同时打开 gnulib 的条件依赖（flexmember / idx / setenv / stdbool /
+#    time_r / timegm / tzset / unsetenv），这些文件都已在 src/gl/ 里；time_rz.c 需要的
+#    系统符号（setenv / unsetenv / timegm / localtime_r / tzset / mktime）在 API 21 就全部存在。
+#    配套的 `-D__timezone_t=tm_zone`（见 function-android.sh 的 gnutls 分支）用来避开
+#    bionic 那个无条件的 typedef 与 gnulib 自己的 `typedef struct tm_zone *timezone_t;`
+#    之间的「不同型重定义」硬错误。
+ac_cv_type_timezone_t=no \
 ./configure \
   --prefix="${LIB_INSTALL_PREFIX}" \
   --with-pic \
