@@ -14,3 +14,7 @@ android/libs/
 android/obj/
 android/**/build/
 ffmpeg-kit-spm/
+
+# Python 字节码（scripts/ci/*.py 本地语法校验会生成）
+__pycache__/
+*.pyc
