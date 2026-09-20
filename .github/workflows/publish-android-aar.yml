@@ -202,7 +202,7 @@ jobs:
           echo "INFO: Gradle ndkVersion <- ${REV}"
           perl -i -pe "s/ndkVersion \"[^\"]*\"/ndkVersion \"${REV}\"/" tools/android/build.lts.gradle
 
-      - name: Build full GPL LTS AAR (same flags as local Mac)
+      - name: Build full GPL LTS AAR (4 ABI, ubuntu-22.04)
         run: |
           set -uo pipefail
           chmod +x ./android.sh
@@ -212,7 +212,9 @@ jobs:
           echo "=== disk ==="
           df -h .
 
-          # ABI 集合：默认 3 个（arm64-v8a / x86 / x86_64）。勾选 include_armv7a 才是 4 个。
+          # ABI 集合：**默认 4 个**（armeabi-v7a / arm64-v8a / x86 / x86_64）。
+          # 这与 inputs.include_armv7a 的 default: true 是同一条判据的两处表述 ——
+          # 改一处必须改另一处。只有把开关置 false 才是 3 个（arm64-v8a / x86 / x86_64）。
           # ⚠️ 应用侧 reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64，
           #    少一个 ABI ⇒ 32 位设备上 FFmpegKit 加载失败（与本次修的崩溃同源）。
           # ⚠️ 「**去掉** armeabi-v7a」必须两个都禁：android.sh 拼 ANDROID_ARCHITECTURES 处的判据是
