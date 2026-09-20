@@ -1,5 +1,24 @@
-# Same recipe as a local macOS full GPL LTS build: same `./android.sh` flags, NDK r28b,
-# ANDROID_PATCH_ROOT, libc++ 16KB relink (via android.sh), and Gradle AAR.
+# 2026-09-20：runner 从 macos-15 换成 **ubuntu-22.04**，与上游对齐。
+#
+#   起因是先在 Mac 本机直接出包，结果查明**本机环境会系统性破坏 autotools**：
+#   宿主为每个 bash 子进程 source 一个 BASH_ENV 脚本，它做两件事 ——
+#     · brokered-sandbox-bash-env.sh:9   export PATH="${CODEBUDDY_BROKERED_BIN_DIR}:$PATH"
+#     · safe-delete-bash-env.sh:4-7      rm() { "<safe-delete-bin>/rm" "$@"; }; export -f rm
+#   于是 configure 探到的是 shim 版的 sed / grep / dd，fribidi 当场死在
+#   `sed: bad pattern '.tmp'@2 (t)`（那个 `@2 (t)` 尾巴不是 sed 的报错格式，是 shim 的注解），
+#   rm 也变成会拒绝删除的包装器（`rm: confNNNNN.dir/confNNNNN.file: Operation not permitted`）。
+#   这是宿主层面的、绕起来很脆；而且 macOS 上 NDK 只提供 darwin-x86_64 host，
+#   整个构建跑在 Rosetta 下。
+#
+#   ⇒ 回到上游唯一验证过的平台：ubuntu-22.04 + 原生 x86_64。
+#     上游所有的 Android workflow 都在 ubuntu-22.04；产出那份现役 AAR 的
+#     android-full-gpl-patched.yml 也是（NDK r28b linux 包、默认 4 个 ABI）。
+#
+# 构建配方：`./android.sh` flags + ANDROID_PATCH_ROOT(patches/android-apply-patches.sh，
+# 由 android.sh:218-220 调用) + libc++ 16KB relink（也在 android.sh 内）+ Gradle AAR。
+# 除 runner 与依赖管理方式外，与上游 android-full-gpl-patched.yml 同源；唯二刻意的差异是
+# --disable-lib-sdl（拔掉 SDL2 的 HIDAPI 孤儿强符号）与 --api-level=23（消除 32/64 位的
+# 编译期 API 分裂）—— 两者在下面 FLAGS 处都有完整判据。
 #
 # ── 2026-09-19 排查与修复 ───────────────────────────────────────────────────────
 # run #1 (e752c56) 死在步骤 8「Build」：android.sh 在第 17 分钟返回 1（完整 build.log
@@ -28,10 +47,10 @@ on:
         required: false
         type: string
       include_armv7a:
-        description: '是否同时构建 armeabi-v7a。默认否（3 ABI，验证更快）；⚠️ 勾上才是 4 ABI，可直接替换现有 AAR。'
+        description: '是否同时构建 armeabi-v7a。**默认是** —— 应用侧 reactNativeArchitectures 就是 4 个 ABI，只有 3 个的 AAR 无法直接替换现役产物，必须改 App 配置。改为 false 可快速跑 3 ABI 验证（16KB 只约束 64 位，armeabi-v7a/x86 与它无关）。'
         required: false
         type: boolean
-        default: false
+        default: true
       keep_going:
         description: '某个库失败时不中止，继续把剩余库跑完并汇总失败清单（默认开）。全量 52 个库里有 26 个从未构建过，关掉它就会「一轮只暴露一个库」。'
         required: false
@@ -52,10 +71,12 @@ env:
 
 jobs:
   build-and-publish:
-    name: Build and publish ffmpeg-kit AAR (macOS, like local Mac)
-    # macos-14 已被 GitHub 标记 deprecated（actions/runner-images#13518），且 Homebrew
-    # 不再为它提供 bottle ⇒ 会回退到源码编译并卡在 netpbm/SVN。macos-15 是 GA。
-    runs-on: macos-15
+    name: Build and publish ffmpeg-kit AAR (ubuntu-22.04, like upstream)
+    # 选 ubuntu-22.04 而不是 ubuntu-24.04 的唯一理由是「与已被验证过能出整包的平台
+    # 逐项一致」—— 24.04 的 GCC 13 会给一批 autotools 库带进新的 -Werror 警告，
+    # 那是另一类变量，不该和这次迁移混在一起。
+    # 若 22.04 退役，切 24.04 并预备处理 GCC 13 的新警告。
+    runs-on: ubuntu-22.04
     # GitHub 托管 runner 的作业硬上限是 6 小时；留出写诊断与上传产物的余量。
     timeout-minutes: 350
     permissions:
@@ -76,24 +97,33 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Install build dependencies (Homebrew)
+      - name: Install build dependencies (apt)
         run: |
           set -euo pipefail
-          # 显式 update 一次即可；禁止每次 install 再自动 update（拖时间并引入配方漂移）
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          brew update
-          brew install \
-            autoconf automake libtool pkg-config nasm cmake texinfo yasm bison \
-            autogen wget gettext meson ninja gperf libtasn1 gpatch
-          # 文档/手册工具链：只服务 man page 生成，构建 .so 用不到。装不上就放行，
-          # 避免 groff → netpbm → SVN 这条链成为单点（它已让 run #2 挂在第 4 步）。
-          for f in groff gtk-doc docbook-xsl; do
-            brew install "$f" \
-              || echo "::warning::optional brew package '$f' failed to install (continuing)"
-          done
-          # bison / gettext 必须排到系统版本前面（macOS 自带的都太老）
-          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          # 必装。逐项对应 android.sh 真正会调用的 host 工具：
+          #   autoconf / automake / libtool(→libtoolize)  autotools 类库（最耗时的一批）
+          #   nasm / yasm                                  x264 / x265 的汇编
+          #   bison / autogen / gperf                      部分库的语法生成
+          #   meson / ninja-build                          dav1d 等 meson 类库
+          #   gettext / texinfo                            libiconv / makeinfo
+          #   libtasn1-6-dev                               gnutls
+          #   patch                                        patches/android-apply-patches.sh 要 GNU patch
+          #   perl                                         下面「Match Gradle ndkVersion」用 perl -i -pe
+          #   python3                                      scripts/ci/verify-aar.py
+          #   curl / wget / unzip / git                    android.sh 下载与解包
+          sudo apt-get install -y \
+            build-essential autoconf automake libtool pkg-config \
+            curl wget git unzip \
+            nasm yasm cmake make \
+            bison autogen gperf meson ninja-build \
+            gettext texinfo \
+            libtasn1-6-dev perl python3 patch
+          # 文档/手册工具链：只服务 man page 生成，构建 .so 用不到。在 ubuntu 上都是
+          # 纯 apt 包（Mac 上曾把 groff → netpbm → SVN 拖成单点，run #2 挂在那里），
+          # 保留「装不上就放行」只是为了不让它成为单点。
+          sudo apt-get install -y groff gtk-doc-tools docbook-utils docbook-xsl \
+            || echo "::warning::optional doc toolchain failed to install (continuing)"
 
       - name: Install Android command-line tools and SDK components
         run: |
@@ -101,8 +131,8 @@ jobs:
           SDK_ROOT="${ANDROID_SDK_ROOT}"
           mkdir -p "${SDK_ROOT}/cmdline-tools"
           rm -rf "${SDK_ROOT}/cmdline-tools/latest" /tmp/android-clt
-          CL_TOOLS_ZIP="/tmp/commandlinetools-mac.zip"
-          curl -fsSL "https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip" -o "${CL_TOOLS_ZIP}"
+          CL_TOOLS_ZIP="/tmp/commandlinetools-linux.zip"
+          curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o "${CL_TOOLS_ZIP}"
           unzip -q -o "${CL_TOOLS_ZIP}" -d /tmp/android-clt
           # Zip is either cmdline-tools/{bin,lib,...} or cmdline-tools/cmdline-tools/...
           if [[ -x /tmp/android-clt/cmdline-tools/bin/sdkmanager ]]; then
@@ -125,10 +155,13 @@ jobs:
           echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
 
-      - name: Install Android NDK r28b (darwin zip, matches typical Mac install)
+      - name: Install Android NDK r28b (linux zip, same as upstream)
         run: |
           set -euo pipefail
-          curl -fsSL "https://dl.google.com/android/repository/android-ndk-r28b-darwin.zip" -o /tmp/ndk.zip
+          # 与上游 android-full-gpl-patched.yml 逐字相同。r28b 的 64 位链接器默认就是
+          # max-page-size=0x4000（r27 默认 0x1000，要靠脚本里显式传 flag 才到 16KB），
+          # 两条路都能满足 16KB —— 这里跟随上游，少一个变量。
+          curl -fsSL "https://dl.google.com/android/repository/android-ndk-r28b-linux.zip" -o /tmp/ndk.zip
           unzip -q -o /tmp/ndk.zip -d "${HOME}/ndk"
           echo "ANDROID_NDK_ROOT=${HOME}/ndk/android-ndk-r28b" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=${HOME}/ndk/android-ndk-r28b" >> "$GITHUB_ENV"
@@ -175,8 +208,24 @@ jobs:
           #    之前那版「3 个 ABI」的承诺是假的（已实测确认）。
           #    「**保留** armeabi-v7a」时方向恰好相反：只禁 arm-v7a、留 neon（见下面的分支注释）。
           #    这两条别互相搬运 —— 一个是「或」判据要求全禁，一个是产物布局要求只留 neon。
+          # ⚠️ --disable-lib-sdl **必须**。SDL2 的 joystick HIDAPI 会在 libavdevice.so
+          #    里留下 17 个 PLATFORM_hid_* 未弱化的孤儿强符号（含 PLATFORM_hid_write）；
+          #    那些库带 DT_FLAGS=BIND_NOW，符号在 dlopen 阶段就立即绑定 ⇒ 真机启动直接崩。
+          #    现役那份 AAR 正是没关 SDL2 编出来的（上游 android-full-gpl-patched.yml
+          #    同样没关），所以眼下要靠 FfmpegKitHidSymbolPatchPlugin.js 事后弱化符号绕。
+          # ⚠️ --api-level=23 **必须**。LTS 默认 API=16，而 android.sh 的架构循环里：
+          #      if (arm64-v8a || x86_64) && [[ ${ORIGINAL_API} -lt 21 ]]; then API=21
+          #    也就是说只有 64 位被抬到 21、32 位留在 16 ⇒ 同一个「编译期 API 级别」
+          #    在 32/64 位之间分裂。libpng 的 ZLIB_VERNUM 自校验与 libvpx 的
+          #    `check_cflags = check_cc -Werror` 都是这么死的，另带 5 个库连坐。
+          #    传 23 ⇒ ORIGINAL_API=23 ≥ 21 ⇒ 走 else 分支，4 个架构**统一 23**，
+          #    与 clang wrapper 的 armv7a-linux-androideabi23-clang 完全一致。
+          #    注意 23 仍 < 24 ⇒ bionic 的 __BIONIC_AVAILABILITY_GUARD(24) 依旧隐藏
+          #    fseeko 的声明 ⇒ scripts/android/tiff.sh 里那两个 ac_cv_func_fseeko*=no
+          #    仍然是必需的，别因为「API 提到 23」就把它删掉。
           FLAGS=(-d --lts --full --enable-gpl --disable-lib-sdl \
-                 --enable-android-media-codec --enable-android-zlib)
+                 --enable-android-media-codec --enable-android-zlib \
+                 --api-level=23)
           if [[ "${{ github.event.inputs.include_armv7a }}" == "true" ]]; then
             ABIS="armeabi-v7a arm64-v8a x86 x86_64"
             # ⚠️ 只关 arm-v7a、**保留 arm-v7a-neon** —— 这才是 armeabi-v7a 那一格的正确来源。
@@ -235,7 +284,7 @@ jobs:
           cp "${AAR_PATH}" "${DEST}"
           echo "aar_path=${DEST}" >> "$GITHUB_OUTPUT"
           ls -lh release-assets/
-          shasum -a 256 release-assets/*.aar
+          sha256sum release-assets/*.aar
 
       # 出厂验收：不合格就让作业红掉，别把一个会在真机 dlopen 阶段崩的包放出去。
       # --expect-abis 直传上面算出来的 BUILD_ABIS —— 让「声明要构建的 ABI」与
@@ -290,7 +339,7 @@ jobs:
             echo "| 构建 ABI | \`${BUILD_ABIS:-?}\` |"
             echo "| 命令 | \`${BUILD_CMD:-?}\` |"
             if [[ -n "${AAR_PATH}" ]]; then
-              echo "| AAR | \`$(basename "${AAR_PATH}")\` · $(du -h "${AAR_PATH}" | cut -f1) · sha256 \`$(shasum -a 256 "${AAR_PATH}" | cut -c1-16)…\` |"
+              echo "| AAR | \`$(basename "${AAR_PATH}")\` · $(du -h "${AAR_PATH}" | cut -f1) · sha256 \`$(sha256sum "${AAR_PATH}" | cut -c1-16)…\` |"
             else
               echo "| AAR | ❌ 未产出 |"
             fi
